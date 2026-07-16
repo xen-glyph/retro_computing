@@ -1,0 +1,52 @@
+——————————————————————————————————————————————————————————————————————————————
+                              WEATHER FAX
+                  Meridian, ID | ZIP 83642 | NWS BOI
+——————————————————————————————————————————————————————————————————————————————
+
+Generated: Thursday, July 16, 2026 | 08:00 MDT
+
+CURRENT CONDITIONS
+——————————————————————————————————————————————————————————————————————————————
+Temperature  70 F                           | Clear
+Dew Point    54 F                           | Humidity 56%
+Wind         ESE 25 mph                     | Pressure 29.90 inHg
+Visibility   10.0 mi                        | Station KMAN
+
+WATCHES / WARNINGS / ADVISORIES
+——————————————————————————————————————————————————————————————————————————————
+RED FLAG WARNING (Severe)
+  Red Flag Warning in effect through 9:00 PM MDT.
+
+HEAT ADVISORY (Moderate)
+  Heat Advisory in effect through 9:00 PM MDT.
+
+FIVE-DAY OUTLOOK
+——————————————————————————————————————————————————————————————————————————————
+TODAY      102/67  Sunny then Isolated Showers And Thunderstorms
+FRIDAY      99/67  Sunny then Slight Chance Showers And Thunderstorms
+SATURDAY   100/66  Sunny
+SUNDAY     100/65  Sunny
+MONDAY      99/65  Mostly Sunny
+
+NEXT PERIODS
+——————————————————————————————————————————————————————————————————————————————
+TODAY
+Isolated showers and thunderstorms after noon. Sunny, with a high near 102.
+
+TONIGHT
+Mostly clear. Low around 67.
+
+AREA FORECAST DISCUSSION
+——————————————————————————————————————————————————————————————————————————————
+KEY MESSAGES
+• Afternoon and evening thunderstorms may produce gusty outflow winds,
+  heavy rain, and hail.
+
+• Hot temperatures continue into early next week.
+
+[Additional discussion omitted to preserve one-page format.]
+
+——————————————————————————————————————————————————————————————————————————————
+Source: NOAA | National Weather Service | Office BOI
+Generated automatically | Plain-text weather bulletin
+——————————————————————————————————————————————————————————————————————————————

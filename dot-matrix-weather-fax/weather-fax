@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""
+Dot Matrix Weather Fax
+======================
+
+A plain-text, one-page weather bulletin built from National Weather Service
+data and designed for impact, dot-matrix, line, and other text-oriented
+printers managed by CUPS.
+
+Author: Caleb Moose
+GitHub: https://github.com/xen-glyph
+Original hardware project: "Seraph" Raspberry Pi + "Sensei" OKI Microline 321
+Public release cleaned and generalized for use with other printers.
+
+The program intentionally prints through the system's default CUPS queue.
+No printer model or queue name is hard-coded.
+
+Usage:
+    weather-fax              Interactive menu
+    weather-fax --generate   Generate text without printing
+    weather-fax --print      Generate and print
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import requests
+
+APP_NAME = "Dot Matrix Weather Fax"
+CONFIG_PATH = Path.home() / ".config" / "dot-matrix-weather-fax" / "config.json"
+WORK_DIR = Path("/tmp/dot-matrix-weather-fax")
+OUTPUT_PATH = WORK_DIR / "weather-fax.txt"
+
+VERSION = "1.0.0"
+
+# The NWS asks API clients to identify themselves. Override this at runtime
+# with WEATHER_FAX_USER_AGENT if you want to include your own contact address.
+DEFAULT_USER_AGENT = (
+    "dot-matrix-weather-fax/1.0 "
+    "(https://github.com/xen-glyph/dot-matrix-weather-fax)"
+)
+HEADERS = {
+    "User-Agent": os.environ.get("WEATHER_FAX_USER_AGENT", DEFAULT_USER_AGENT)
+}
+
+WIDTH = 78
+RULE = "—" * WIDTH
+MAX_LINES = 58
+
+USE_COLOR = sys.stdout.isatty()
+RESET = "\033[0m" if USE_COLOR else ""
+WHITE = "\033[1;37m" if USE_COLOR else ""
+GREEN = "\033[1;32m" if USE_COLOR else ""
+BLUE = "\033[1;34m" if USE_COLOR else ""
+
+
+# ---------------------------------------------------------------------------
+# Terminal helpers
+# ---------------------------------------------------------------------------
+
+def clear() -> None:
+    os.system("clear")
+
+
+def terminal_header(title: str) -> None:
+    print(f"{WHITE}{RULE}{RESET}")
+    print(f"{GREEN}{title.center(WIDTH)}{RESET}")
+    print(f"{WHITE}{RULE}{RESET}")
+    print()
+
+
+def pause() -> None:
+    input(f"\n{BLUE}Press Enter to continue...{RESET}")
+
+
+# ---------------------------------------------------------------------------
+# Configuration and HTTP
+# ---------------------------------------------------------------------------
+
+def save_config(config: dict[str, Any]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def load_config() -> dict[str, Any] | None:
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def get_json(url: str, timeout: int = 20) -> dict[str, Any]:
+    response = requests.get(url, headers=HEADERS, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def resolve_zip(zip_code: str) -> dict[str, Any]:
+    data = get_json(f"https://api.zippopotam.us/us/{zip_code}")
+    place = data["places"][0]
+    return {
+        "zip": zip_code,
+        "lat": float(place["latitude"]),
+        "lon": float(place["longitude"]),
+        "location": f'{place["place name"]}, {place["state abbreviation"]}',
+    }
+
+
+def resolve_nws(config: dict[str, Any]) -> dict[str, Any]:
+    point = get_json(
+        f'https://api.weather.gov/points/{config["lat"]:.4f},{config["lon"]:.4f}'
+    )["properties"]
+
+    config.update(
+        {
+            "office": point["cwa"],
+            "forecast_url": point["forecast"],
+            "forecast_hourly_url": point.get("forecastHourly"),
+            "stations_url": point["observationStations"],
+            "forecast_zone": point.get("forecastZone"),
+            "county_zone": point.get("county"),
+            "fire_zone": point.get("fireWeatherZone"),
+            "radar_station": point.get("radarStation"),
+        }
+    )
+    return config
+
+
+def setup_location() -> dict[str, Any] | None:
+    clear()
+    terminal_header("Set Weather Fax Location")
+    zip_code = input(f"{BLUE}Enter ZIP code: {RESET}").strip()
+
+    if not re.fullmatch(r"\d{5}", zip_code):
+        print("\nZIP code must contain five digits.")
+        pause()
+        return None
+
+    try:
+        config = resolve_nws(resolve_zip(zip_code))
+        save_config(config)
+    except Exception as exc:
+        print(f"\nUnable to set location: {exc}")
+        pause()
+        return None
+
+    print(f"\nSaved: {GREEN}{config['location']}{RESET}")
+    print(f"NWS office: {GREEN}{config['office']}{RESET}")
+    pause()
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Unit conversion and observations
+# ---------------------------------------------------------------------------
+
+def safe_value(obj: dict[str, Any], key: str) -> float | None:
+    try:
+        value = obj[key]["value"]
+        return None if value is None else float(value)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def c_to_f(value: float | None) -> float | None:
+    return None if value is None else (value * 9.0 / 5.0) + 32.0
+
+
+def mps_to_mph(value: float | None) -> float | None:
+    return None if value is None else value * 2.236936
+
+
+def pa_to_inhg(value: float | None) -> float | None:
+    return None if value is None else value * 0.000295299830714
+
+
+def meters_to_miles(value: float | None) -> float | None:
+    return None if value is None else value * 0.000621371
+
+
+def get_current_observation(config: dict[str, Any]) -> dict[str, Any] | None:
+    stations = get_json(config["stations_url"])
+    features = stations.get("features", [])
+    if not features:
+        return None
+
+    for feature in features[:5]:
+        station_id = feature["properties"]["stationIdentifier"]
+        try:
+            obs = get_json(
+                f"https://api.weather.gov/stations/{station_id}/observations/latest"
+            )["properties"]
+
+            pressure = safe_value(obs, "barometricPressure")
+            if pressure is None:
+                pressure = safe_value(obs, "seaLevelPressure")
+
+            return {
+                "station": station_id,
+                "description": obs.get("textDescription") or "Observation unavailable",
+                "temperature_f": c_to_f(safe_value(obs, "temperature")),
+                "dewpoint_f": c_to_f(safe_value(obs, "dewpoint")),
+                "humidity": safe_value(obs, "relativeHumidity"),
+                "wind_mph": mps_to_mph(safe_value(obs, "windSpeed")),
+                "wind_gust_mph": mps_to_mph(safe_value(obs, "windGust")),
+                "wind_direction": safe_value(obs, "windDirection"),
+                "pressure_inhg": pa_to_inhg(pressure),
+                "visibility_miles": meters_to_miles(safe_value(obs, "visibility")),
+            }
+        except Exception:
+            continue
+
+    return None
+
+
+def get_forecast(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return get_json(config["forecast_url"])["properties"]["periods"]
+
+
+def get_alerts(config: dict[str, Any]) -> list[dict[str, str]]:
+    try:
+        data = get_json(
+            f'https://api.weather.gov/alerts/active?point='
+            f'{config["lat"]:.4f},{config["lon"]:.4f}'
+        )
+    except Exception:
+        return []
+
+    alerts: list[dict[str, str]] = []
+    for feature in data.get("features", []):
+        props = feature.get("properties", {})
+        alerts.append(
+            {
+                "event": props.get("event") or "Weather Alert",
+                "severity": props.get("severity") or "Unknown",
+                "headline": props.get("headline") or props.get("description") or "",
+            }
+        )
+    return alerts
+
+
+def get_afd(config: dict[str, Any]) -> str | None:
+    """Fetch the latest AFD. Failure is nonfatal."""
+    try:
+        listing = get_json(
+            f'https://api.weather.gov/products?type=AFD&location={config["office"]}'
+        )
+        graph = listing.get("@graph", [])
+        if not graph:
+            return None
+
+        product_id = graph[0].get("id") or graph[0].get("@id")
+        if not product_id:
+            return None
+
+        if str(product_id).startswith(("http://", "https://")):
+            product_url = str(product_id)
+        else:
+            product_url = f"https://api.weather.gov/products/{product_id}"
+
+        return get_json(product_url).get("productText")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Text processing
+# ---------------------------------------------------------------------------
+
+def normalize_spaces(text: str | None) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def sentence_split(text: str) -> list[str]:
+    text = normalize_spaces(text)
+    if not text:
+        return []
+    return re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
+
+
+def extract_afd_section(afd: str | None, names: list[str]) -> str:
+    if not afd:
+        return ""
+
+    lines = afd.splitlines()
+    start: int | None = None
+
+    for index, line in enumerate(lines):
+        upper = line.upper().strip()
+        if any(name in upper for name in names):
+            start = index + 1
+            break
+
+    if start is None:
+        return ""
+
+    collected: list[str] = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped.startswith(".") and collected:
+            break
+        if stripped in {"&&", "$$"}:
+            break
+        if re.match(r"^[A-Z]{2,}\.\.\.$", stripped):
+            break
+        collected.append(line)
+
+    return normalize_spaces(" ".join(collected))
+
+
+def afd_key_messages(afd: str | None, limit: int = 3) -> list[str]:
+    key_section = extract_afd_section(
+        afd, [".KEY MESSAGES", "KEY MESSAGES", ".DISCUSSION"]
+    )
+    short_section = extract_afd_section(
+        afd, [".SHORT TERM", "SHORT TERM", ".NEAR TERM", "NEAR TERM"]
+    )
+
+    candidates = sentence_split(key_section)
+    if len(candidates) < limit:
+        candidates.extend(sentence_split(short_section))
+
+    weather_terms = (
+        "warning", "watch", "advisory", "thunder", "storm", "snow", "rain",
+        "wind", "gust", "heat", "cold", "freeze", "fog", "fire", "smoke",
+        "temperature", "front", "precipitation", "confidence"
+    )
+
+    ranked: list[tuple[int, int, str]] = []
+    for sentence in candidates:
+        cleaned = sentence.strip(" -*•\t")
+        if len(cleaned) < 25:
+            continue
+        score = sum(1 for term in weather_terms if term in cleaned.lower())
+        ranked.append((score, -len(cleaned), cleaned))
+
+    ranked.sort(reverse=True)
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for _, _, sentence in ranked:
+        key = sentence.lower()[:100]
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(sentence)
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+
+def afd_short_term_summary(afd: str | None, max_sentences: int = 3) -> str:
+    section = extract_afd_section(
+        afd, [".SHORT TERM", "SHORT TERM", ".NEAR TERM", "NEAR TERM"]
+    )
+    sentences = [s for s in sentence_split(section) if len(s) >= 25]
+    return " ".join(sentences[:max_sentences])
+
+
+def direction_text(degrees: float | None) -> str:
+    if degrees is None:
+        return "Variable"
+    directions = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+    ]
+    return directions[int((degrees + 11.25) / 22.5) % 16]
+
+
+def fmt_number(value: float | None, decimals: int = 0, suffix: str = "") -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.{decimals}f}{suffix}"
+
+
+def wrap(text: str, width: int = WIDTH, initial: str = "", subsequent: str = "") -> list[str]:
+    return textwrap.wrap(
+        normalize_spaces(text),
+        width=width,
+        initial_indent=initial,
+        subsequent_indent=subsequent,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [""]
+
+
+def section(lines: list[str], title: str) -> None:
+    lines.append(title)
+    lines.append(RULE)
+
+
+def paired_daily_forecast(
+    periods: list[dict[str, Any]], days: int = 5
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    index = 0
+
+    while index < len(periods) and len(result) < days:
+        period = periods[index]
+        if period.get("isDaytime"):
+            low = None
+            if index + 1 < len(periods) and not periods[index + 1].get("isDaytime"):
+                low = periods[index + 1].get("temperature")
+
+            result.append(
+                {
+                    "name": period.get("name", "Period"),
+                    "high": period.get("temperature"),
+                    "low": low,
+                    "forecast": period.get("shortForecast", ""),
+                }
+            )
+        index += 1
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# One-page formatter
+# ---------------------------------------------------------------------------
+
+def trim_to_page(lines: list[str]) -> list[str]:
+    """
+    Enforce the one-page budget. The footer is preserved. If unusually long
+    hazards or AFD text consume too much space, the middle is shortened.
+    """
+    if len(lines) <= MAX_LINES:
+        return lines
+
+    footer = lines[-4:]
+    body = lines[:-4]
+    available = MAX_LINES - len(footer)
+
+    if len(body) > available:
+        body = body[: max(0, available - 1)]
+        body.append("[Additional discussion omitted to preserve one-page format.]")
+
+    return body + footer
+
+
+def build_fax(config: dict[str, Any]) -> Path:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+    observation = get_current_observation(config)
+    periods = get_forecast(config)
+    alerts = get_alerts(config)
+    afd = get_afd(config)
+
+    lines: list[str] = []
+
+    lines.append(RULE)
+    lines.append("SERAPH WEATHER FAX".center(WIDTH))
+    subtitle = (
+        f'{config["location"]} | ZIP {config["zip"]} | NWS {config["office"]}'
+    )
+    lines.append(subtitle.center(WIDTH))
+    lines.append(RULE)
+    lines.append("")
+
+    generated = datetime.now().astimezone().strftime(
+        "Generated: %A, %B %-d, %Y | %H:%M %Z"
+    )
+    lines.append(generated)
+    lines.append("")
+
+    section(lines, "CURRENT CONDITIONS")
+
+    if observation:
+        wind = (
+            f'{direction_text(observation["wind_direction"])} '
+            f'{fmt_number(observation["wind_mph"], 0, " mph")}'
+        )
+        if observation["wind_gust_mph"] is not None:
+            wind += f' gusting {fmt_number(observation["wind_gust_mph"], 0, " mph")}'
+
+        left1 = f'Temperature  {fmt_number(observation["temperature_f"], 0, " F")}'
+        right1 = observation["description"]
+        left2 = f'Dew Point    {fmt_number(observation["dewpoint_f"], 0, " F")}'
+        right2 = f'Humidity {fmt_number(observation["humidity"], 0, "%")}'
+        left3 = f'Wind         {wind}'
+        right3 = f'Pressure {fmt_number(observation["pressure_inhg"], 2, " inHg")}'
+        left4 = f'Visibility   {fmt_number(observation["visibility_miles"], 1, " mi")}'
+        right4 = f'Station {observation["station"]}'
+
+        lines.append(f"{left1:<38} | {right1}")
+        lines.append(f"{left2:<38} | {right2}")
+        lines.append(f"{left3:<38} | {right3}")
+        lines.append(f"{left4:<38} | {right4}")
+    else:
+        lines.append("Current observation unavailable.")
+
+    lines.append("")
+    section(lines, "WATCHES / WARNINGS / ADVISORIES")
+
+    if alerts:
+        for alert in alerts[:2]:
+            label = f'{alert["event"].upper()} ({alert["severity"]})'
+            lines.extend(wrap(label))
+            if alert["headline"]:
+                lines.extend(wrap(alert["headline"], initial="  ", subsequent="  "))
+    else:
+        lines.append("No active watches, warnings, or advisories.")
+
+    lines.append("")
+    section(lines, "FIVE-DAY OUTLOOK")
+
+    for day in paired_daily_forecast(periods):
+        high = "N/A" if day["high"] is None else str(day["high"])
+        low = "N/A" if day["low"] is None else str(day["low"])
+        name = str(day["name"]).upper()[:10]
+        forecast = normalize_spaces(str(day["forecast"]))
+        lines.append(f"{name:<10} {high:>3}/{low:<3}  {forecast}")
+
+    lines.append("")
+    section(lines, "NEXT PERIODS")
+
+    for period in periods[:2]:
+        lines.append(str(period.get("name", "PERIOD")).upper())
+        detail = period.get("detailedForecast") or period.get("shortForecast") or ""
+        lines.extend(wrap(str(detail)))
+        lines.append("")
+
+    section(lines, "AREA FORECAST DISCUSSION")
+    lines.append("KEY MESSAGES")
+
+    messages = afd_key_messages(afd, limit=3)
+    if messages:
+        for message in messages:
+            lines.extend(wrap(message, initial="• ", subsequent="  "))
+            lines.append("")
+    else:
+        lines.append("No key-message section was available in the latest AFD.")
+        lines.append("")
+
+    lines.append("SHORT TERM")
+    short_term = afd_short_term_summary(afd, max_sentences=3)
+    if short_term:
+        lines.extend(wrap(short_term))
+    else:
+        lines.append("Short-term discussion was unavailable.")
+
+    lines.append("")
+    lines.append(RULE)
+    lines.append(
+        f'Source: NOAA | National Weather Service | Office {config["office"]}'
+    )
+    lines.append("Generated automatically | Plain-text weather bulletin")
+    lines.append(RULE)
+
+    lines = trim_to_page(lines)
+    OUTPUT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return OUTPUT_PATH
+
+
+# ---------------------------------------------------------------------------
+# Printing and user interface
+# ---------------------------------------------------------------------------
+
+def print_fax(path: Path) -> None:
+    subprocess.run(["lp", str(path)], check=True)
+
+
+def generate(print_after: bool = False, pause_after: bool = True) -> Path | None:
+    config = load_config()
+    if not config:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                f"No configuration found at {CONFIG_PATH}; run weather-fax interactively."
+            )
+        config = setup_location()
+        if not config:
+            return None
+
+    clear()
+    terminal_header(APP_NAME)
+    print(f"Location: {GREEN}{config['location']}{RESET}")
+    print("Fetching current observation, hazards, forecast, and AFD...")
+    print("Building one-page plain-text weather fax...")
+
+    try:
+        output = build_fax(config)
+    except Exception as exc:
+        print(f"\nUnable to build fax: {exc}")
+        if pause_after:
+            pause()
+        return None
+
+    print(f"\nCreated: {GREEN}{output}{RESET}")
+
+    if print_after:
+        try:
+            print_fax(output)
+            print(f"Sent to default printer: {GREEN}success{RESET}")
+        except Exception as exc:
+            print(f"Printing failed: {exc}")
+
+    if pause_after:
+        pause()
+
+    return output
+
+
+def print_test() -> None:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    test_path = WORK_DIR / "printer-test.txt"
+    test_path.write_text(
+        f"{RULE}\n"
+        f"{'SERAPH WEATHER FAX'.center(WIDTH)}\n"
+        f"{RULE}\n"
+        "Native text printer test\n"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ\n"
+        "abcdefghijklmnopqrstuvwxyz\n"
+        "0123456789 !@#$%^&*()\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["lp", str(test_path)], check=True)
+
+
+def main() -> None:
+    while True:
+        config = load_config()
+        clear()
+        terminal_header(APP_NAME)
+
+        if config:
+            print(f"Location: {GREEN}{config['location']}{RESET}")
+            print(f"ZIP: {GREEN}{config['zip']}{RESET}")
+            print(f"Office: {GREEN}{config['office']}{RESET}")
+        else:
+            print("No location configured.")
+
+        print()
+        print(f"{BLUE}1){RESET} Generate and Print Weather Fax")
+        print(f"{BLUE}2){RESET} Generate Fax Only")
+        print(f"{BLUE}3){RESET} Print Native Text Test")
+        print(f"{BLUE}4){RESET} Set / Change Location")
+        print(f"{BLUE}q){RESET} Quit")
+
+        choice = input(f"\n{BLUE}Select: {RESET}").strip().lower()
+
+        if choice == "1":
+            generate(print_after=True)
+        elif choice == "2":
+            generate()
+        elif choice == "3":
+            try:
+                print_test()
+                print("\nTest sent to the default printer.")
+            except Exception as exc:
+                print(f"\nTest failed: {exc}")
+            pause()
+        elif choice == "4":
+            setup_location()
+        elif choice == "q":
+            clear()
+            return
+
+
+if __name__ == "__main__":
+    if "--version" in sys.argv:
+        print(f"{APP_NAME} {VERSION}")
+    elif "--print" in sys.argv:
+        generate(print_after=True, pause_after=False)
+    elif "--generate" in sys.argv:
+        generate(print_after=False, pause_after=False)
+    else:
+        main()
