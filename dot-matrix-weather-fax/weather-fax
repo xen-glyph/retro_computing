@@ -9,7 +9,7 @@ printers managed by CUPS.
 
 Author: Caleb Moose
 GitHub: https://github.com/xen-glyph
-Original hardware project: "Seraph" Raspberry Pi + "Sensei" OKI Microline 321
+Original hardware project: "Seraph" Raspberry Pi 4 + "Sensei" OKI Microline 321 Turbo
 Public release cleaned and generalized for use with other printers.
 
 The program intentionally prints through the system's default CUPS queue.
